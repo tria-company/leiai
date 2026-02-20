@@ -20,9 +20,17 @@ from config import settings
 from openai_client import OpenAIClient
 
 # Variáveis globais (inicializadas no main_loop)
-supabase = None
+# supabase = None # Removed global client
 ai_client = None
 semaphore = None
+
+# Thread-local storage for Supabase clients
+_thread_local = threading.local()
+
+def get_supabase():
+    if not hasattr(_thread_local, 'client'):
+        _thread_local.client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+    return _thread_local.client
 
 # Arquivo CSV de saída
 CSV_OUTPUT = "resultados_analise.csv"
@@ -237,7 +245,7 @@ def process_file_task(record):
             print(f"Processando: {filename}" + (f" [projeto: {str(projeto_id)[:8]}...]" if projeto_id else ""))
             
             # 1. Marcar como PROCESSANDO
-            supabase.table(settings.TABLE_GERENCIAMENTO).update(
+            get_supabase().table(settings.TABLE_GERENCIAMENTO).update(
                 {"status": "PROCESSANDO", "started_at": "now()"}
             ).eq("id", doc_id_db).execute()
 
@@ -252,7 +260,7 @@ def process_file_task(record):
             print(f"   Baixando: {storage_path} ({file_extension})")
             
             # 2.1 Download do arquivo
-            data = supabase.storage.from_("processos").download(storage_path)
+            data = get_supabase().storage.from_("processos").download(storage_path)
             
             # 2.2 Processar de acordo com o tipo
             if is_excel:
@@ -279,7 +287,7 @@ def process_file_task(record):
                     tmp_path = tmp.name
 
             # 3. Carregar prompt do projeto (ou legado id=1)
-            current_prompt = load_prompt_from_db(supabase, projeto_id)
+            current_prompt = load_prompt_from_db(get_supabase(), projeto_id)
             if not current_prompt:
                 raise ValueError("Prompt não configurado. Configure no frontend ou crie prompt_custom.txt")
             
@@ -350,26 +358,26 @@ REGRAS CRÍTICAS DE EXTRAÇÃO:
                 }
                 if projeto_id:
                     insert_payload['projeto_id'] = projeto_id
-                supabase.table('resultados_analise').insert(insert_payload).execute()
+                get_supabase().table('resultados_analise').insert(insert_payload).execute()
                 print(f"   Resultado salvo no Supabase para exportacao")
             except Exception as db_error:
                 print(f"[AVISO] Erro ao salvar no Supabase (CSV local foi salvo): {db_error}")
             
             # 5. Remover arquivo do Storage (bucket)
             try:
-                supabase.storage.from_("processos").remove([storage_path])
+                get_supabase().storage.from_("processos").remove([storage_path])
                 print(f"   Arquivo removido do Storage")
             except Exception as delete_error:
                 print(f"[AVISO] Erro ao remover do bucket (confira RLS DELETE em storage.objects): {delete_error}")
             
             # 6. Remover registro da fila (limpar banco)
             try:
-                supabase.table(settings.TABLE_GERENCIAMENTO).delete().eq("id", doc_id_db).execute()
+                get_supabase().table(settings.TABLE_GERENCIAMENTO).delete().eq("id", doc_id_db).execute()
                 print(f"   Registro removido da fila (documento_gerenciamento)")
             except Exception as db_del_error:
                 # Fallback: marcar como CONCLUIDO se delete falhar (ex.: RLS)
                 try:
-                    supabase.table(settings.TABLE_GERENCIAMENTO).update(
+                    get_supabase().table(settings.TABLE_GERENCIAMENTO).update(
                         {"status": "CONCLUIDO", "completed_at": "now()"}
                     ).eq("id", doc_id_db).execute()
                     print(f"   [AVISO] Delete da fila falhou; status atualizado para CONCLUIDO: {db_del_error}")
@@ -386,7 +394,7 @@ REGRAS CRÍTICAS DE EXTRAÇÃO:
             
             # Salvar erro no banco
             try:
-                supabase.table(settings.TABLE_GERENCIAMENTO).update(
+                get_supabase().table(settings.TABLE_GERENCIAMENTO).update(
                     {"status": "ERRO", "error_message": error_msg}
                 ).eq("id", doc_id_db).execute()
             except Exception as update_error:
@@ -402,9 +410,9 @@ REGRAS CRÍTICAS DE EXTRAÇÃO:
 
 def main_loop():
     # Inicialização
-    global supabase, ai_client, semaphore
+    global ai_client, semaphore
     
-    supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+    # supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY) # Global disabled
     
     # ai_client = GeminiClient()
     try:
@@ -416,7 +424,7 @@ def main_loop():
     semaphore = threading.Semaphore(settings.MAX_WORKERS)
     
     # Verificar se há prompt configurado (qualquer projeto ou legado)
-    test_prompt = load_prompt_from_db(supabase, None)
+    test_prompt = load_prompt_from_db(get_supabase(), None)
     if not test_prompt:
         print("[ERRO] Prompt nao configurado!")
         print("   Configure o prompt no frontend ou crie 'prompt_custom.txt'")
@@ -435,39 +443,93 @@ def main_loop():
     
     while True:
         try:
-            # Só processa quando houver registro em processar_agora (botão "Iniciar processamento")
-            trigger_resp = supabase.table(TABLE_PROCESSAR_AGORA).select("id, projeto_id").limit(settings.MAX_WORKERS).execute()
-            triggers = trigger_resp.data if trigger_resp.data else []
+            # 1. Watchdog: Reset jobs stuck in PROCESSANDO for > 15 min
+            from datetime import timedelta
+            timeout_limit = datetime.now() - timedelta(minutes=15)
+            
+            try:
+                # Reset stuck documents
+                get_supabase().table(settings.TABLE_GERENCIAMENTO).update(
+                    {"status": "PENDENTE", "error_message": "Watchdog: Reset após timeout (15min)"}
+                ).eq("status", "PROCESSANDO") \
+                 .lt("started_at", timeout_limit.isoformat()) \
+                 .execute()
+            except Exception as w_err:
+                print(f"[WATCHDOG] Erro ao verificar timeouts: {w_err}")
+
+            # 2. Check Triggers (Priority Boost)
+            trigger_resp = get_supabase().table(TABLE_PROCESSAR_AGORA).select("id, projeto_id").limit(1).execute()
+            triggers = trigger_resp.data or []
             
             if not triggers:
+                # No triggers -> sleep and wait
                 time.sleep(5)
                 continue
             
-            # Para cada disparo, busca PENDENTES do projeto e processa
             for trigger in triggers:
                 projeto_id = trigger.get("projeto_id")
-                try:
-                    query = supabase.table(settings.TABLE_GERENCIAMENTO).select("*").eq("status", "PENDENTE").not_.is_("storage_path", "null").limit(settings.MAX_WORKERS)
-                    if projeto_id:
-                        query = query.eq("projeto_id", projeto_id)
-                    response = query.execute()
-                    files = response.data if response.data else []
-                    if files:
-                        print(f"Processando {len(files)} arquivo(s) (projeto: {projeto_id or 'todos'})")
+                print(f"[WORKER] Trigger detectado para projeto: {projeto_id}")
+                
+                # LOOP DO PROJETO: Processa até acabar os pendentes deste projeto
+                empty_cycles = 0
+                while True:
+                    try:
+                        # Busca lote de PENDENTES
+                        query = get_supabase().table(settings.TABLE_GERENCIAMENTO).select("*") \
+                            .eq("status", "PENDENTE").not_.is_("storage_path", "null") \
+                            .limit(settings.MAX_WORKERS)
+                        
+                        if projeto_id:
+                            query = query.eq("projeto_id", projeto_id)
+                            
+                        response = query.execute()
+                        files = response.data or []
+                        
+                        if not files:
+                            empty_cycles += 1
+                            if empty_cycles >= 2: # Confirm twice before exiting
+                                print(f"[WORKER] Fim da fila para projeto {projeto_id}. Removendo trigger.")
+                                get_supabase().table(TABLE_PROCESSAR_AGORA).delete().eq("id", trigger["id"]).execute()
+                                break
+                            time.sleep(2)
+                            continue
+                            
+                        empty_cycles = 0
+                        print(f"[WORKER] Processando lote de {len(files)} arquivos...")
+
+                        # CRITICAL FIX: Mark as PROCESSANDO immediately in main thread to prevent duplicates
+                        file_ids = [f['id'] for f in files]
+                        try:
+                            get_supabase().table(settings.TABLE_GERENCIAMENTO).update(
+                                {"status": "PROCESSANDO", "started_at": "now()"}
+                            ).in_("id", file_ids).execute()
+                        except Exception as update_err:
+                            print(f"[ERRO] Falha ao marcar lote como PROCESSANDO: {update_err}")
+                            time.sleep(1)
+                            continue
+                        
+                        futures = []
                         for file_record in files:
-                            executor.submit(process_file_task, file_record)
-                        time.sleep(2)
-                finally:
-                    supabase.table(TABLE_PROCESSAR_AGORA).delete().eq("id", trigger["id"]).execute()
+                            futures.append(executor.submit(process_file_task, file_record))
+                        
+                        # Wait for batch completion to manage memory? 
+                        # No, let the semaphore handle concurrency. 
+                        # Just ensure we don't flood the queue faster than processing.
+                        while executor._work_queue.qsize() > settings.MAX_WORKERS * 2:
+                            time.sleep(1)
+                            
+                    except Exception as loop_error:
+                        print(f"[ERRO] Erro no loop do projeto: {loop_error}")
+                        time.sleep(5)
             
-            time.sleep(2)
+            time.sleep(1)
 
         except KeyboardInterrupt:
             print("\nWorker interrompido pelo usuario")
             executor.shutdown(wait=True)
             break
         except Exception as e:
-            print(f"[AVISO] Erro no loop: {e}")
+            print(f"[AVISO] Erro no loop principal: {e}")
             import traceback
             traceback.print_exc()
             time.sleep(5)

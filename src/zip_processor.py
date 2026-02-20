@@ -9,11 +9,20 @@ from supabase import create_client
 from config import settings
 from browser_downloader import BrowserDownloader
 from openai_client import OpenAIClient
+import threading
+
+# Thread-local storage for Supabase Service Role clients (Bypass RLS)
+_thread_local = threading.local()
+
+def get_supabase_service_role():
+    if not hasattr(_thread_local, 'client'):
+        _thread_local.client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
+    return _thread_local.client
 
 class ZipProcessor:
     def __init__(self):
         # Use Service Role Key to bypass RLS for storage uploads
-        self.supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
+        # self.supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY) # Global disabled
         self.browser_downloader = BrowserDownloader()
         # Initialize OpenAI client for OCR validation
         try:
@@ -31,6 +40,14 @@ class ZipProcessor:
             # 1. Download ZIP using browser (handles JavaScript redirects)
             print(f"   Baixando ZIP via navegador: {zip_url[:50]}...")
             zip_bytes = self.browser_downloader.download_file(zip_url, timeout_ms=60000)
+            
+            # ZIP Size Limit Check
+            max_size_mb = getattr(settings, 'MAX_ZIP_SIZE_MB', 200) # Default 200MB
+            if len(zip_bytes) > max_size_mb * 1024 * 1024:
+                 error_msg = f"ZIP muito grande ({len(zip_bytes) // (1024*1024)}MB > {max_size_mb}MB)"
+                 print(f"   [AVISO] {error_msg}")
+                 return {"success": False, "error": error_msg}
+
             zip_buffer = io.BytesIO(zip_bytes)
             
             # 2. Open ZIP and find files
@@ -126,7 +143,7 @@ class ZipProcessor:
                 content_type = "application/pdf" if file_type == "PDF" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 
                 try:
-                    self.supabase.storage.from_("processos").upload(
+                    get_supabase_service_role().storage.from_("processos").upload(
                         path=storage_path,
                         file=valid_file_bytes,
                         file_options={"content-type": content_type, "upsert": "true"}
@@ -141,7 +158,7 @@ class ZipProcessor:
                 
                 # 7. Register in DB
                 try:
-                    self.supabase.table(settings.TABLE_GERENCIAMENTO).insert({
+                    get_supabase_service_role().table(settings.TABLE_GERENCIAMENTO).insert({
                         "filename": safe_filename,
                         "storage_path": storage_path,
                         "status": "PENDENTE",
@@ -161,7 +178,7 @@ class ZipProcessor:
                 # 8. Trigger Worker immediately
                 if projeto_id:
                     try:
-                        self.supabase.table(settings.TABLE_PROCESSAR_AGORA).insert({
+                        get_supabase_service_role().table(settings.TABLE_PROCESSAR_AGORA).insert({
                             "projeto_id": projeto_id
                         }).execute()
                         print("   Worker acionado automaticamente.")

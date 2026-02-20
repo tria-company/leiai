@@ -65,7 +65,7 @@ function ResultsViewer({ projetoId, onExportExcel }) {
                 .from('resultados_analise')
                 .select('*')
                 .order('data_processamento', { ascending: false })
-                .limit(100)
+                .limit(10000)
             if (projetoId) query = query.eq('projeto_id', projetoId)
             const { data, error } = await query
             if (error) throw error

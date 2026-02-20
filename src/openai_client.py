@@ -1,4 +1,6 @@
 import openai
+import time
+import threading
 from config import settings
 # import fitz  # PyMuPDF (Removed)
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -10,7 +12,26 @@ class OpenAIClient:
         
         self.client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
         self.model_name = settings.MODEL_OPENAI
-        print(f"[OK] Cliente OpenAI inicializado: {self.model_name}")
+        
+        # Rate Limiting (Prevent 429 Errors)
+        self._rpm_limit = getattr(settings, 'OPENAI_RPM_LIMIT', 500) # Default Tier 1: 500 RPM
+        self._call_interval = 60.0 / self._rpm_limit
+        self._last_call_time = 0
+        self._rate_lock = threading.Lock()
+        
+        print(f"[OK] Cliente OpenAI inicializado: {self.model_name} (RPM Limit: {self._rpm_limit})")
+
+    def _wait_for_rate_limit(self):
+        """Block thread to respect Rate Limit"""
+        with self._rate_lock:
+            current_time = time.time()
+            elapsed = current_time - self._last_call_time
+            
+            if elapsed < self._call_interval:
+                sleep_time = self._call_interval - elapsed
+                time.sleep(sleep_time)
+            
+            self._last_call_time = time.time()
 
     def analyze_document(self, file_path: str, prompt_text: str) -> str:
         """
@@ -100,6 +121,9 @@ class OpenAIClient:
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def _call_openai(self, text: str, prompt: str) -> str:
         try:
+            # Enforce Rate Limit
+            self._wait_for_rate_limit()
+
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[

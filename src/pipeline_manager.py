@@ -7,10 +7,18 @@ from salesforce_client import SalesforceClient
 from zip_processor import ZipProcessor
 
 # Globals
-supabase = None
+# supabase = None # Removed global client
 sf_client = None
 zip_processor = None
 semaphore = None
+
+# Thread-local storage for Supabase clients
+_thread_local = threading.local()
+
+def get_supabase():
+    if not hasattr(_thread_local, 'client'):
+        _thread_local.client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+    return _thread_local.client
 
 def process_case_task(case_record):
     """
@@ -25,8 +33,10 @@ def process_case_task(case_record):
         try:
             print(f"Iniciando Caso: {case_number}")
             
+            print(f"Iniciando Caso: {case_number}")
+            
             # CRITICAL: Mark as PROCESSANDO immediately to prevent duplicate processing
-            update_result = supabase.table(settings.TABLE_CASOS).update(
+            update_result = get_supabase().table(settings.TABLE_CASOS).update(
                 {"status": "PROCESSANDO", "updated_at": "now()"}
             ).eq("id", case_id).eq("status", "PENDENTE").execute()
             
@@ -41,7 +51,9 @@ def process_case_task(case_record):
             
             if not zip_urls:
                 print(f"   [AVISO] Nenhum ZIP encontrado para caso {case_number}.")
-                supabase.table(settings.TABLE_CASOS).update({
+            if not zip_urls:
+                print(f"   [AVISO] Nenhum ZIP encontrado para caso {case_number}.")
+                get_supabase().table(settings.TABLE_CASOS).update({
                     "status": "CONCLUIDO",
                     "error_message": "Nenhum arquivo ZIP disponivel",
                     "updated_at": "now()"
@@ -65,7 +77,7 @@ def process_case_task(case_record):
                     print(f"   URL: {zip_url[:50]}...")
                     
                     # Update DB status
-                    supabase.table(settings.TABLE_CASOS).update({
+                    get_supabase().table(settings.TABLE_CASOS).update({
                         "zip_url": zip_url,
                         "status": "PROCESSA_ZIP"
                     }).eq("id", case_id).execute()
@@ -103,7 +115,7 @@ def process_case_task(case_record):
                     print(f"\n[OK] Caso {case_number}: {total_processed} ZIP(s) processado(s), {total_skipped} ZIP(s) sem arquivos relevantes")
                 else:
                     print(f"\n[OK] Caso {case_number}: {total_processed} ZIP(s) processado(s) com sucesso!")
-                supabase.table(settings.TABLE_CASOS).update({
+                get_supabase().table(settings.TABLE_CASOS).update({
                     "status": "CONCLUIDO",
                     "updated_at": "now()",
                     "error_message": None
@@ -113,7 +125,7 @@ def process_case_task(case_record):
                 if errors:
                     error_summary += ": " + "; ".join(errors[:2])
                 print(f"\n[AVISO] Caso {case_number}: {error_summary}")
-                supabase.table(settings.TABLE_CASOS).update({
+                get_supabase().table(settings.TABLE_CASOS).update({
                     "status": "CONCLUIDO" if total_processed > 0 else "ERRO",
                     "updated_at": "now()",
                     "error_message": error_summary[:500]
@@ -128,7 +140,7 @@ def process_case_task(case_record):
             
             # Fetch current case from DB to get retry_count
             try:
-                current_case = supabase.table(settings.TABLE_CASOS).select("retry_count").eq("id", case_id).single().execute()
+                current_case = get_supabase().table(settings.TABLE_CASOS).select("retry_count").eq("id", case_id).single().execute()
                 current_retry_count = current_case.data.get('retry_count', 0) if current_case.data else 0
             except:
                 current_retry_count = 0
@@ -137,7 +149,7 @@ def process_case_task(case_record):
                 # Re-queue for retry
                 new_retry_count = current_retry_count + 1
                 print(f"   🔄 Erro de conexão detectado. Recolocando na fila (tentativa {new_retry_count}/3)...")
-                supabase.table(settings.TABLE_CASOS).update({
+                get_supabase().table(settings.TABLE_CASOS).update({
                     "status": "PENDENTE",
                     "retry_count": new_retry_count,
                     "updated_at": "now()",
@@ -149,7 +161,7 @@ def process_case_task(case_record):
                 if is_server_disconnect:
                     error_msg = f"Falhou após 3 tentativas: {error_msg}"
                 print(f"   Marcando caso como ERRO no banco...")
-                supabase.table(settings.TABLE_CASOS).update({
+                get_supabase().table(settings.TABLE_CASOS).update({
                     "status": "ERRO",
                     "error_message": error_msg,
                     "updated_at": "now()"
@@ -157,10 +169,10 @@ def process_case_task(case_record):
                 print(f"   [OK] Status de erro registrado.")
 
 def main_loop():
-    global supabase, sf_client, zip_processor, semaphore
+    global sf_client, zip_processor, semaphore
     
     # Initialize
-    supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+    # supabase = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY) # Global disabled
     sf_client = SalesforceClient()
     zip_processor = ZipProcessor()
     
@@ -180,10 +192,24 @@ def main_loop():
     
     print(f"   Aguardando casos na tabela '{settings.TABLE_CASOS}'...")
 
+    # Watchdog loop
     while True:
         try:
-            # Poll PENDING cases
-            response = supabase.table(settings.TABLE_CASOS)\
+            # 1. Watchdog: Reset cases stuck for > 20 min
+            try:
+                from datetime import timedelta, datetime
+                timeout_limit = datetime.now() - timedelta(minutes=20)
+                
+                get_supabase().table(settings.TABLE_CASOS).update(
+                    {"status": "PENDENTE", "error_message": "Watchdog: Reset após timeout (20min)"}
+                ).in_("status", ["PROCESSANDO", "PROCESSA_ZIP", "BAIXANDO"]) \
+                 .lt("updated_at", timeout_limit.isoformat()) \
+                 .execute()
+            except Exception as w_err:
+                print(f"[WATCHDOG] Erro: {w_err}")
+
+            # 2. Poll PENDING cases
+            response = get_supabase().table(settings.TABLE_CASOS)\
                 .select("*")\
                 .eq("status", "PENDENTE")\
                 .limit(start_workers)\
